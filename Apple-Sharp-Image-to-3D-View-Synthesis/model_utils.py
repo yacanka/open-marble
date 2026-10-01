@@ -18,9 +18,11 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Final, Literal
 
+import gradio as gr
 import torch
 
 try:
@@ -47,6 +49,14 @@ TrajectoryType = Literal["swipe", "shake", "rotate", "rotate_forward"]
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+
+def _report(message: str, progress: float | tuple[int, int] | None = None) -> None:
+    """Report real milestones in the current Gradio request, including GPU workers."""
+    gr.Progress()(progress, desc=message, unit="frames" if isinstance(progress, tuple) else "steps")
+    if progress is None:
+        # Progress counters are coalesced by Gradio; log events retain short phases.
+        gr.Info(f"OpenMarble progress: {message}", visible=False)
 
 
 def _now_ms() -> int:
@@ -107,14 +117,24 @@ class _PatchedVideoWriter(io.VideoWriter):
     """Ensure depth writer is closed so files can be safely cleaned up."""
 
     def __init__(
-        self, output_path: Path, fps: float = 30.0, render_depth: bool = True
+        self, output_path: Path, fps: float = 30.0, render_depth: bool = True,
+        *, total_frames: int | None = None
     ) -> None:
         super().__init__(output_path, fps=fps, render_depth=render_depth)
+        self._total_frames = total_frames
+        self._completed_frames = 0
         # Ensure attribute exists for downstream code paths.
         if not hasattr(self, "depth_writer"):
             self.depth_writer = None  # type: ignore[attribute-defined-outside-init]
 
+    def add_frame(self, *args, **kwargs):
+        super().add_frame(*args, **kwargs)
+        self._completed_frames += 1
+        if self._total_frames:
+            _report("Rendering video frames", (self._completed_frames, self._total_frames))
+
     def close(self):
+        _report("Encoding and saving video preview")
         super().close()
         depth_writer = getattr(self, "depth_writer", None)
         try:
@@ -125,10 +145,10 @@ class _PatchedVideoWriter(io.VideoWriter):
 
 
 @contextmanager
-def _patched_sharp_videowriter():
+def _patched_sharp_videowriter(num_frames: int):
     """Temporarily patch `sharp.utils.io.VideoWriter` used by `sharp.cli.render`."""
     original = io.VideoWriter
-    io.VideoWriter = _PatchedVideoWriter  # type: ignore[assignment]
+    io.VideoWriter = partial(_PatchedVideoWriter, total_frames=num_frames)  # type: ignore[assignment]
     try:
         yield
     finally:
@@ -195,11 +215,13 @@ class ModelWrapper:
     def _load_state_dict(self) -> dict:
         with self._lock:
             if self._state_dict is not None:
+                _report("Using cached SHARP model weights")
                 return self._state_dict
 
             # 1) Explicit local checkpoint path
             if self.checkpoint_path is not None:
                 try:
+                    _report("Loading SHARP model weights from local checkpoint")
                     self._state_dict = torch.load(
                         self.checkpoint_path,
                         weights_only=True,
@@ -213,6 +235,7 @@ class ModelWrapper:
                         f"Original error:\n  {type(e).__name__}: {e}"
                     ) from e
 
+            _report("Checking the SHARP model cache")
             # 2) HF cache (no-network): best match for Spaces `preload_from_hub`.
             hf_cache_error: Exception | None = None
             if try_to_load_from_cache is not None:
@@ -228,6 +251,7 @@ class ModelWrapper:
 
                 try:
                     if isinstance(cached, str) and Path(cached).exists():
+                        _report("Loading cached SHARP model weights into memory")
                         self._state_dict = torch.load(
                             cached, weights_only=True, map_location="cpu"
                         )
@@ -250,6 +274,7 @@ class ModelWrapper:
                             local_files_only=True,
                         )
                         if Path(ckpt_path).exists():
+                            _report("Loading cached SHARP model weights into memory")
                             self._state_dict = torch.load(
                                 ckpt_path, weights_only=True, map_location="cpu"
                             )
@@ -258,11 +283,13 @@ class ModelWrapper:
                     pass
 
                 try:
+                    _report("Downloading SHARP model weights if missing; first use may take several minutes")
                     ckpt_path = hf_hub_download(
                         repo_id=self.hf_repo_id,
                         filename=self.hf_filename,
                         revision=self.hf_revision,
                     )
+                    _report("Loading downloaded SHARP model weights into memory")
                     self._state_dict = torch.load(
                         ckpt_path,
                         weights_only=True,
@@ -275,6 +302,7 @@ class ModelWrapper:
             # 4) Default upstream CDN (torch hub cache). Last resort.
             url_error: Exception | None = None
             try:
+                _report("Loading SHARP weights from the fallback model source")
                 self._state_dict = torch.hub.load_state_dict_from_url(
                     self.checkpoint_url,
                     progress=True,
@@ -320,6 +348,7 @@ class ModelWrapper:
         with self._lock:
             if self._predictor is None:
                 state_dict = self._load_state_dict()
+                _report("Building SHARP model and applying weights")
                 predictor = create_predictor(PredictorParams())
                 predictor.load_state_dict(state_dict)
                 predictor.eval()
@@ -330,9 +359,11 @@ class ModelWrapper:
             assert self._predictor_device is not None
 
             if self._predictor_device != device:
+                _report(f"Moving SHARP model to {device.type.upper()}")
                 self._predictor.to(device)
                 self._predictor_device = device
 
+            _report(f"SHARP model ready on {device.type.upper()}")
             return self._predictor
 
     def _maybe_move_model_back_to_cpu(self) -> None:
@@ -356,17 +387,21 @@ class ModelWrapper:
             raise FileNotFoundError(f"Image does not exist: {image_path}")
 
         device = _select_device(self.device_preference)
+        _report(f"Preparing SHARP model on {device.type.upper()}")
         predictor = self._get_predictor(device)
 
+        _report("Reading image and camera parameters")
         image_np, _, f_px = io.load_rgb(image_path)
         height, width = image_np.shape[:2]
 
+        _report(f"Reconstructing 3D geometry from {width} × {height} image on {device.type.upper()}")
         with torch.no_grad():
             gaussians = predict_image(predictor, image_np, f_px, device)
 
         stem = self._make_output_stem(image_path)
         ply_path = self.outputs_dir / f"{stem}.ply"
 
+        _report("Exporting Gaussian splats to a PLY scene")
         # save_ply expects (height, width).
         save_ply(gaussians, f_px, (height, width), ply_path)
 
@@ -377,6 +412,7 @@ class ModelWrapper:
             color_space="linearRGB",
         )
 
+        _report("Releasing inference resources")
         self._maybe_move_model_back_to_cpu()
 
         return PredictionOutputs(
@@ -413,7 +449,7 @@ class ModelWrapper:
                 num_steps=int(num_frames),
                 num_repeats=1,
             )
-            with _patched_sharp_videowriter():
+            with _patched_sharp_videowriter(num_frames):
                 sharp_render_gaussians(
                     gaussians=gaussians,
                     metadata=metadata,
@@ -478,7 +514,7 @@ class ModelWrapper:
         renderer = GSplatRenderer(color_space=metadata.color_space)
 
         # IMPORTANT: Keep render_depth=True (avoids upstream AttributeError).
-        video_writer = _PatchedVideoWriter(output_path, fps=float(fps), render_depth=True)
+        video_writer = _PatchedVideoWriter(output_path, fps=float(fps), render_depth=True, total_frames=len(trajectory))
 
         for eye_position in trajectory:
             cam_info = cam_model.compute(eye_position)
@@ -541,11 +577,14 @@ class ModelWrapper:
         pred = self.predict_to_ply(image_path)
 
         if not render_video:
+            _report("Video preview disabled; 3D scene is ready")
             return None, pred.ply_path
 
         if not torch.cuda.is_available():
+            _report("Video preview skipped: CUDA is unavailable; 3D scene is ready")
             return None, pred.ply_path
 
+        _report(f"Rendering video preview: {num_frames} frames at {fps} FPS, {trajectory_type} camera")
         output_stem = pred.ply_path.with_suffix("").name
         video_path = self.render_video(
             gaussians=pred.gaussians,
@@ -556,6 +595,7 @@ class ModelWrapper:
             fps=fps,
             output_long_side=output_long_side,
         )
+        _report("3D scene and video preview are ready", 1.0)
         return video_path, pred.ply_path
 
 

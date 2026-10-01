@@ -32,7 +32,12 @@ export default function OpenMarbleLayout({
 }) {
   return (
     <div className="relative mx-auto flex w-full flex-col items-center justify-center">
-      <Ornament tabs={tabs}>{children}</Ornament>
+      <Ornament
+        tabs={tabs}
+        className="max-w-5xl xl:max-w-[1400px] 2xl:max-w-[1600px]"
+      >
+        {children}
+      </Ornament>
       <WindowControls />
     </div>
   )

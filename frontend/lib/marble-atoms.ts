@@ -1,15 +1,23 @@
 import { atom } from 'jotai'
+import type { ProgressEntry } from './generation-progress'
 
 export interface GenerationJob {
   id: string
   status: 'imagining' | 'uploading' | 'processing' | 'completed' | 'error'
   imagePreviewUrl?: string
   plyUrl?: string
+  plyUrls?: string[]
   videoUrl?: string
   plyFilename?: string
   error?: string
   sourceUrl?: string
+  imageCount?: number
   createdAt: number
+  finishedAt?: number
+  imageNames?: string[]
+  progress?: ProgressEntry
+  history?: ProgressEntry[]
+  lastActivityAt?: number
 }
 
 export interface GalleryItem {

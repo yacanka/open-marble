@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useCallback, useRef, useState } from 'react'
+import { Suspense, useCallback, useMemo, useRef, useState } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { Stack } from '@/components/core/stack'
 import { Button } from '@/components/core/button'
@@ -14,6 +14,9 @@ import {
 } from '@/components/marble/scene-viewer'
 import { AssetPanel } from '@/components/marble/asset-panel'
 import { cn } from '@/lib/utils'
+import { useAtomValue } from 'jotai'
+import { currentJobAtom } from '@/lib/marble-atoms'
+import { ProcessingOverlay } from '@/components/marble/processing-overlay'
 
 function TransformToolbar({
   mode,
@@ -63,9 +66,16 @@ function TransformToolbar({
 }
 
 function ViewerContent() {
+  const job = useAtomValue(currentJobAtom)
+  const [showReport, setShowReport] = useState(false)
   const searchParams = useSearchParams()
   const router = useRouter()
-  const plyUrl = searchParams.get('ply')
+  const sceneQuery = searchParams.toString()
+  const plyUrls = useMemo(
+    () => new URLSearchParams(sceneQuery).getAll('ply').filter(Boolean),
+    [sceneQuery],
+  )
+  const plyUrl = plyUrls[0]
   const viewerRef = useRef<SceneViewerHandle>(null)
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [transformMode, setTransformMode] = useState<TransformMode>('translate')
@@ -123,18 +133,30 @@ function ViewerContent() {
             </Button>
           ),
           headerRight: (
-            <Button variant="secondary" className="rounded-full" asChild>
-              <a href={plyUrl} download>
-                Download
-              </a>
-            </Button>
+            <div className="flex items-center gap-2">
+              {job?.status === 'completed' && job.plyUrls?.includes(plyUrl) && (
+                <Button variant="secondary" className="rounded-full" onClick={() => setShowReport(true)}>
+                  Generation report
+                </Button>
+              )}
+              {plyUrls.length > 1 && (
+                <Text size="caption1" variant="secondary">
+                  {plyUrls.length} scene layers
+                </Text>
+              )}
+              <Button variant="secondary" className="rounded-full" asChild>
+                <a href={plyUrl} download>
+                  Download
+                </a>
+              </Button>
+            </div>
           ),
         }}
       >
         <div className="relative flex h-full overflow-hidden rounded-b-[var(--view-radius)]">
           <SceneViewer
             ref={viewerRef}
-            plyUrl={plyUrl}
+            plyUrls={plyUrls}
             className="flex-1"
             onSelectModel={setSelectedModelId}
             onTransformModeChange={setTransformMode}
@@ -146,6 +168,7 @@ function ViewerContent() {
           />
         </div>
       </Stack>
+      <ProcessingOverlay job={showReport ? job : null} onDismiss={() => setShowReport(false)} onViewScene={() => setShowReport(false)} />
       <AssetPanel
         onAddAsset={handleAddAsset}
         selectedModelId={selectedModelId}

@@ -19,7 +19,7 @@ export interface SceneViewerHandle {
 }
 
 interface SceneViewerProps {
-  plyUrl: string
+  plyUrls: string[]
   className?: string
   onReady?: () => void
   onSelectModel?: (id: string | null) => void
@@ -34,7 +34,7 @@ interface PlacedMesh {
 
 const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
   function SceneViewer(
-    { plyUrl, className, onReady, onSelectModel, onTransformModeChange },
+    { plyUrls, className, onReady, onSelectModel, onTransformModeChange },
     ref,
   ) {
     const containerRef = useRef<HTMLDivElement>(null)
@@ -90,6 +90,8 @@ const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
       if (!container) return
 
       let cancelled = false
+      setLoading(true)
+      setError(null)
 
       async function init() {
         const THREE = await import('three')
@@ -127,7 +129,8 @@ const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
           0.1,
           500,
         )
-        camera.position.set(0, 1.5, 4)
+        const cameraDistance = Math.max(4, 3.5 + plyUrls.length * 1.35)
+        camera.position.set(0, 1.5, cameraDistance)
 
         // Lights
         const ambientLight = new THREE.AmbientLight(0xffffff, 0.6)
@@ -168,11 +171,30 @@ const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
             sharedMemoryForWorkers: false,
           })
 
-          await splatViewer.addSplatScene(plyUrl, {
-            splatAlphaRemovalThreshold: 5,
-            showLoadingUI: false,
-            rotation: [1, 0, 0, 0],
-          })
+          const sceneSpacing = 2.25
+          const sceneCenter = (plyUrls.length - 1) / 2
+          let loadedSceneCount = 0
+
+          for (const [index, plyUrl] of plyUrls.entries()) {
+            try {
+              await splatViewer.addSplatScene(plyUrl, {
+                splatAlphaRemovalThreshold: 5,
+                showLoadingUI: false,
+                position: [(index - sceneCenter) * sceneSpacing, 0, 0],
+                rotation: [1, 0, 0, 0],
+              })
+              loadedSceneCount += 1
+            } catch (sceneError) {
+              console.error(
+                `Failed to load scene layer ${index + 1}:`,
+                sceneError,
+              )
+            }
+          }
+
+          if (loadedSceneCount === 0) {
+            throw new Error('None of the generated scene layers could be loaded')
+          }
         } catch (e) {
           console.error('Failed to load Gaussian Splat:', e)
           if (!cancelled)
@@ -333,7 +355,7 @@ const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
         cancelled = true
         cleanupPromise.then((cleanup) => cleanup?.())
       }
-    }, [plyUrl, onReady, onSelectModel, onTransformModeChange, selectMesh])
+    }, [plyUrls, onReady, onSelectModel, onTransformModeChange, selectMesh])
 
     // Expose methods to parent
     const addModel = useCallback(
@@ -411,7 +433,13 @@ const SceneViewer = forwardRef<SceneViewerHandle, SceneViewerProps>(
       >
         {loading && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/30">
-            <p className="text-sm text-white/70">Loading 3D scene...</p>
+            <p className="text-sm text-white/70">
+              Loading{' '}
+              {plyUrls.length > 1
+                ? `${plyUrls.length} scene layers`
+                : '3D scene'}
+              ...
+            </p>
           </div>
         )}
         {error && (

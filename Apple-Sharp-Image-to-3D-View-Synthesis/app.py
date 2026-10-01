@@ -93,7 +93,7 @@ def run_sharp(
     num_frames: int,
     fps: int,
     render_video: bool,
-    progress=gr.Progress()
+    progress=gr.Progress(track_tqdm=True)
 ) -> tuple[str | None, dict, str]:
     """
     Main Inference Function
@@ -113,7 +113,7 @@ def run_sharp(
         traj_enum = trajectory_type
 
     try:
-        progress(0.1, desc="Initializing SHARP model on GPU...")
+        progress(None, desc="Preparing the SHARP inference worker")
         
         # Call the backend model
         video_path, ply_path = predict_and_maybe_render_gpu(
@@ -124,6 +124,8 @@ def run_sharp(
             output_long_side=out_long_side_val,
             render_video=bool(render_video),
         )
+
+        progress(None, desc="Preparing generated files for transfer")
 
         # Prepare outputs
         status_msg = f"### ✅ Success\nGenerated: `{ply_path.name}`"

@@ -1,13 +1,16 @@
 'use client'
 
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAtom } from 'jotai'
 import { Stack } from '@/components/core/stack'
 import { Button } from '@/components/core/button'
 import { Text } from '@/components/core/text'
 import { Material } from '@/components/core/material'
-import { ImageUpload } from '@/components/marble/image-upload'
+import {
+  ImageUpload,
+  type SelectedImage,
+} from '@/components/marble/image-upload'
 import { ProcessingOverlay } from '@/components/marble/processing-overlay'
 import {
   StreetViewInput,
@@ -16,27 +19,76 @@ import {
 import { currentJobAtom } from '@/lib/marble-atoms'
 import { generateWorld, generateImageFromText, extractImageFromUrl } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { appendProgress, type GenerationProgress } from '@/lib/generation-progress'
 
 type InputMode = 'image' | 'text' | 'maps' | 'url'
+
+const MAX_IMAGES = 4
+const SUPPORTED_IMAGE_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+])
 
 export default function CreatePage() {
   const router = useRouter()
   const [job, setJob] = useAtom(currentJobAtom)
   const [mode, setMode] = useState<InputMode>('image')
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([])
+  const [selectionError, setSelectionError] = useState<string | null>(null)
   const [textPrompt, setTextPrompt] = useState('')
   const [urlInput, setUrlInput] = useState('')
   const [streetViewReady, setStreetViewReady] = useState(false)
   const streetViewRef = useRef<StreetViewInputHandle>(null)
+  const previewUrlsRef = useRef(new Set<string>())
 
-  const handleFileSelect = useCallback((file: File) => {
-    setSelectedFile(file)
-    setPreviewUrl(URL.createObjectURL(file))
+  useEffect(() => {
+    const previewUrls = previewUrlsRef.current
+    return () => {
+      for (const previewUrl of previewUrls) URL.revokeObjectURL(previewUrl)
+      previewUrls.clear()
+    }
+  }, [])
+
+  const handleFilesSelect = useCallback(
+    (files: File[]) => {
+      const supportedFiles = files.filter((file) =>
+        SUPPORTED_IMAGE_TYPES.has(file.type),
+      )
+      const availableSlots = MAX_IMAGES - selectedImages.length
+      const filesToAdd = supportedFiles.slice(0, availableSlots)
+
+      if (supportedFiles.length !== files.length) {
+        setSelectionError('Only PNG, JPG, and WebP images are supported.')
+      } else if (supportedFiles.length > availableSlots) {
+        setSelectionError(`You can use up to ${MAX_IMAGES} images in one scene.`)
+      } else {
+        setSelectionError(null)
+      }
+
+      const nextImages = filesToAdd.map((file) => {
+        const previewUrl = URL.createObjectURL(file)
+        previewUrlsRef.current.add(previewUrl)
+        return { file, previewUrl }
+      })
+      setSelectedImages((current) => [...current, ...nextImages])
+    },
+    [selectedImages.length],
+  )
+
+  const handleRemoveImage = useCallback((index: number) => {
+    setSelectedImages((current) => {
+      const image = current[index]
+      if (!image) return current
+      URL.revokeObjectURL(image.previewUrl)
+      previewUrlsRef.current.delete(image.previewUrl)
+      return current.filter((_, currentIndex) => currentIndex !== index)
+    })
+    setSelectionError(null)
   }, [])
 
   const handleGenerate = useCallback(async () => {
-    if (mode === 'image' && !selectedFile) return
+    if (mode === 'image' && selectedImages.length === 0) return
     if (mode === 'text' && !textPrompt.trim()) return
     if (mode === 'maps' && (!streetViewReady || !streetViewRef.current)) return
     if (mode === 'url' && !urlInput.trim()) return
@@ -45,13 +97,17 @@ export default function CreatePage() {
     setJob({
       id: jobId,
       status: mode === 'text' || mode === 'url' ? 'imagining' : 'uploading',
-      imagePreviewUrl: previewUrl ?? undefined,
+      imagePreviewUrl: selectedImages[0]?.previewUrl,
+      imageCount: mode === 'image' ? selectedImages.length : 1,
       sourceUrl: mode === 'url' ? urlInput.trim() : undefined,
       createdAt: Date.now(),
+      imageNames: selectedImages.map(({ file }) => file.name),
+      history: [],
+      lastActivityAt: Date.now(),
     })
 
     try {
-      let imageFile: File
+      let imageFiles: File[]
 
       if (mode === 'text') {
         // Step 1: Generate image from text via Replicate Minimax
@@ -60,7 +116,11 @@ export default function CreatePage() {
         // Step 2: Download the generated image as a File
         const imgRes = await fetch(image_url)
         const blob = await imgRes.blob()
-        imageFile = new File([blob], 'imagined.jpeg', { type: blob.type || 'image/jpeg' })
+        imageFiles = [
+          new File([blob], 'imagined.jpeg', {
+            type: blob.type || 'image/jpeg',
+          }),
+        ]
 
         setJob((prev) =>
           prev
@@ -74,7 +134,11 @@ export default function CreatePage() {
         // Step 2: Download the extracted image as a File
         const imgRes = await fetch(image_url)
         const blob = await imgRes.blob()
-        imageFile = new File([blob], 'extracted.jpeg', { type: blob.type || 'image/jpeg' })
+        imageFiles = [
+          new File([blob], 'extracted.jpeg', {
+            type: blob.type || 'image/jpeg',
+          }),
+        ]
 
         setJob((prev) =>
           prev
@@ -83,47 +147,68 @@ export default function CreatePage() {
         )
       } else if (mode === 'maps') {
         // Capture the current Street View frame
-        imageFile = await streetViewRef.current!.captureImage()
+        const streetView = streetViewRef.current
+        if (!streetView) throw new Error('Select a Street View location first')
+        imageFiles = [await streetView.captureImage()]
       } else {
-        imageFile = selectedFile!
+        imageFiles = selectedImages.map(({ file }) => file)
       }
 
-      // Generate the 3D world from the image
-      setJob((prev) =>
-        prev ? { ...prev, status: 'processing' } : null,
-      )
-      const result = await generateWorld(imageFile)
+      const onProgress = (event: GenerationProgress) => {
+        const entry = { ...event, receivedAt: Date.now() }
+        setJob((prev) => prev?.id === jobId ? {
+          ...prev,
+          status: event.stage === 'uploading' ? 'uploading' : 'processing',
+          progress: entry,
+          history: appendProgress(prev.history ?? [], entry),
+          lastActivityAt: entry.receivedAt,
+        } : prev)
+      }
+      setJob((prev) => prev ? { ...prev, imageNames: imageFiles.map((file) => file.name) } : null)
+      onProgress({ type: 'progress', stage: 'uploading', message: `Uploading ${imageFiles.length} image(s) to the server` })
+      const result = await generateWorld(imageFiles, {
+        onProgress,
+        onHeartbeat: () => setJob((prev) => prev?.id === jobId ? { ...prev, lastActivityAt: Date.now() } : prev),
+      })
+      onProgress({
+        type: 'progress', stage: 'completed',
+        message: `${result.scenes.length} scene(s) ready${result.errors.length ? `; ${result.errors.length} image(s) failed` : ''}`,
+      })
+      const plyUrls = result.scenes.map((scene) => scene.ply_url)
       setJob((prev) =>
         prev
           ? {
               ...prev,
               status: 'completed',
+              finishedAt: Date.now(),
               plyUrl: result.ply_url,
+              plyUrls,
               plyFilename: result.ply_filename,
               videoUrl: result.video_url ?? undefined,
             }
           : null,
       )
-      router.push(
-        `/openmarble/viewer?ply=${encodeURIComponent(result.ply_url)}`,
-      )
+      const viewerParams = new URLSearchParams()
+      for (const plyUrl of plyUrls) viewerParams.append('ply', plyUrl)
+      if (result.errors.length === 0) router.push(`/openmarble/viewer?${viewerParams.toString()}`)
     } catch (error) {
       setJob((prev) =>
         prev
           ? {
               ...prev,
               status: 'error',
+              finishedAt: Date.now(),
               error:
                 error instanceof Error ? error.message : 'Unknown error',
             }
           : null,
       )
     }
-  }, [mode, selectedFile, textPrompt, urlInput, previewUrl, streetViewReady, setJob, router])
+  }, [mode, selectedImages, textPrompt, urlInput, streetViewReady, setJob, router])
 
   const canGenerate =
     mode === 'image'
-      ? !!selectedFile
+      ? selectedImages.length > 0
       : mode === 'text'
         ? !!textPrompt.trim()
         : mode === 'url'
@@ -266,13 +351,15 @@ export default function CreatePage() {
           {mode === 'image' && (
             <>
               <ImageUpload
-                onFileSelect={handleFileSelect}
-                previewUrl={previewUrl}
+                images={selectedImages}
+                onFilesSelect={handleFilesSelect}
+                onRemove={handleRemoveImage}
+                maxFiles={MAX_IMAGES}
               />
 
-              {selectedFile && (
-                <Text size="callout" variant="secondary">
-                  {selectedFile.name}
+              {selectionError && (
+                <Text size="callout" className="text-red-400">
+                  {selectionError}
                 </Text>
               )}
             </>
@@ -349,11 +436,14 @@ export default function CreatePage() {
               className="rounded-full px-8"
               onClick={handleGenerate}
               disabled={
+                job?.status === 'imagining' ||
                 job?.status === 'uploading' ||
                 job?.status === 'processing'
               }
             >
-              Generate 3D World
+              {selectedImages.length > 1 && mode === 'image'
+                ? `Generate Wide Scene from ${selectedImages.length} Images`
+                : 'Generate 3D World'}
             </Button>
           )}
 
@@ -365,7 +455,15 @@ export default function CreatePage() {
         </div>
       </Stack>
 
-      <ProcessingOverlay job={job} />
+      <ProcessingOverlay
+        job={job}
+        onDismiss={() => setJob(null)}
+        onViewScene={() => {
+          const params = new URLSearchParams()
+          for (const url of job?.plyUrls ?? []) params.append('ply', url)
+          router.push(`/openmarble/viewer?${params}`)
+        }}
+      />
     </>
   )
 }

@@ -1,7 +1,7 @@
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000'
-const SUPERSPLAT_URL =
-  process.env.NEXT_PUBLIC_SUPERSPLAT_URL || '/supersplat/index.html'
+import { type GenerationProgress, readGenerationStream } from './generation-progress'
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000'
+const SUPERSPLAT_URL = process.env.NEXT_PUBLIC_SUPERSPLAT_URL || '/supersplat/index.html'
 
 export async function checkHealth() {
   const res = await fetch(`${BACKEND_URL}/api/health`)
@@ -13,33 +13,94 @@ export async function checkHealth() {
   }>
 }
 
+async function readGenerationResponse<T>(
+  response: Response,
+  onProgress?: (event: GenerationProgress) => void,
+  onHeartbeat?: () => void
+): Promise<T> {
+  if (!onProgress) return response.json()
+  if (!response.body) throw new Error('Progress stream unavailable')
+  return readGenerationStream<T>(response.body, onProgress, onHeartbeat)
+}
+
 export async function generateWorld(
-  imageFile: File,
-  options?: { renderVideo?: boolean; trajectoryType?: string },
+  imageFiles: File | File[],
+  options?: {
+    renderVideo?: boolean
+    trajectoryType?: string
+    onProgress?: (event: GenerationProgress) => void
+    onHeartbeat?: () => void
+  }
 ) {
+  const files = Array.isArray(imageFiles) ? imageFiles : [imageFiles]
+  if (files.length === 0) throw new Error('Select at least one image')
+
   const formData = new FormData()
-  formData.append('image', imageFile)
+  for (const file of files) formData.append('images', file)
 
   const params = new URLSearchParams()
-  if (options?.renderVideo) params.set('render_video', 'true')
-  if (options?.trajectoryType)
-    params.set('trajectory_type', options.trajectoryType)
+  if (options?.onProgress) params.set('stream', 'true')
+  if (options?.renderVideo !== undefined) {
+    params.set('render_video', String(options.renderVideo))
+  }
+  if (options?.trajectoryType) params.set('trajectory_type', options.trajectoryType)
 
   const url = `${BACKEND_URL}/api/generate${params.toString() ? `?${params}` : ''}`
-  const res = await fetch(url, { method: 'POST', body: formData })
+  let res: Response
+  try {
+    res = await fetch(url, { method: 'POST', body: formData })
+  } catch {
+    throw new Error(
+      'The 3D generation service could not be reached. Make sure the backend and SHARP services are running.'
+    )
+  }
 
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: 'Unknown error' }))
-    throw new Error(error.detail || 'Generation failed')
+    const detail = typeof error.detail === 'string' ? error.detail : 'Generation failed'
+    throw new Error(detail)
   }
 
-  return res.json() as Promise<{
+  type GenerationResult = {
     id: string
     ply_url: string
     ply_filename: string
     video_url: string | null
     thumbnail_url: string | null
-  }>
+    scenes?: GeneratedScene[]
+    errors?: Array<{ filename: string; message: string }>
+  }
+
+  const result = await readGenerationResponse<GenerationResult>(
+    res,
+    options?.onProgress,
+    options?.onHeartbeat
+  )
+
+  const scenes =
+    result.scenes && result.scenes.length > 0
+      ? result.scenes
+      : [
+          {
+            id: result.id,
+            ply_url: result.ply_url,
+            ply_filename: result.ply_filename,
+            video_url: result.video_url,
+            thumbnail_url: result.thumbnail_url,
+            source_filename: files[0]?.name ?? 'image',
+          },
+        ]
+
+  return { ...result, scenes, errors: result.errors ?? [] }
+}
+
+export interface GeneratedScene {
+  id: string
+  ply_url: string
+  ply_filename: string
+  video_url: string | null
+  thumbnail_url: string | null
+  source_filename: string
 }
 
 export async function fetchGallery() {

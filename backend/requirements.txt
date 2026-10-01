@@ -1,4 +1,6 @@
-fastapi>=0.115.0
+# Keep uploaded files open until streaming responses finish.
+fastapi>=0.118.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
-gradio_client>=1.5.0
+# Retain all queued status/log events through Job async iteration.
+gradio_client>=2.7.0
